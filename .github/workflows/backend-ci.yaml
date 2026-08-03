@@ -1,0 +1,180 @@
+name: Backend Continuous Integration
+
+on:
+  # Run on PRs against main, only when the backend application changes.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+      - '.github/workflows/backend-ci.yaml'
+      - '.github/actions/backend-setup/**'
+
+  # Runnable on-demand.
+  workflow_dispatch:
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.10'
+  WORKING_DIRECTORY: starter/backend
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # LINT and TEST run in PARALLEL (neither declares `needs:`).
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache and install dependencies
+        uses: ./.github/actions/backend-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      # `pipenv run lint` maps to `flake8`, configured by starter/backend/.flake8
+      # (max-line-length=120). flake8 exits non-zero on any finding.
+      - name: Run lint
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: pipenv run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache and install dependencies
+        uses: ./.github/actions/backend-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      # `pipenv run test` maps to `pytest -v`.
+      - name: Run tests
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: pipenv run test
+
+  # ---------------------------------------------------------------------------
+  # BUILD gated on lint + test via `needs:`.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache and install dependencies
+        uses: ./.github/actions/backend-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Run tests
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: pipenv run test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The backend image compiles uwsgi from source, so the layer cache saves
+      # several minutes per run.
+      - name: Build docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKING_DIRECTORY }}
+          push: false
+          load: true
+          tags: mp-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Boot the image and hit /movies, exactly like the dev notes describe.
+      - name: Smoke test the image
+        run: |
+          docker run --name mp-backend -d -p 5000:5000 mp-backend:latest
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:5000/movies > /dev/null; then
+              echo "Backend responded:"
+              curl -s http://localhost:5000/movies
+              docker rm -f mp-backend
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Backend container did not become healthy in 60s"
+          docker logs mp-backend
+          docker rm -f mp-backend
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Error handling / notification.
+  # ---------------------------------------------------------------------------
+  report:
+    name: Report status
+    needs: [lint, test, build]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Write job summary
+        run: |
+          {
+            echo "## Backend CI results"
+            echo ""
+            echo "| Job | Result |"
+            echo "| --- | ------ |"
+            echo "| Lint | ${{ needs.lint.result }} |"
+            echo "| Test | ${{ needs.test.result }} |"
+            echo "| Build | ${{ needs.build.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment results on the pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              Lint: '${{ needs.lint.result }}',
+              Test: '${{ needs.test.result }}',
+              Build: '${{ needs.build.result }}',
+            };
+            const icon = (r) => (r === 'success' ? '✅' : r === 'skipped' ? '⚪️' : '❌');
+            const rows = Object.entries(results)
+              .map(([job, r]) => `| ${job} | ${icon(r)} ${r} |`)
+              .join('\n');
+            const failed = Object.values(results).some((r) => r === 'failure');
+            const body = [
+              '### Backend Continuous Integration',
+              '',
+              '| Job | Result |',
+              '| --- | ------ |',
+              rows,
+              '',
+              failed
+                ? `❌ One or more jobs failed. [View the run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`
+                : '✅ All backend CI checks passed.',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Fail the workflow if any job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "::error::Backend CI failed - see the job summary above."
+          exit 1

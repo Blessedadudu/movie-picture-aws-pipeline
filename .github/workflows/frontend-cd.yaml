@@ -1,0 +1,235 @@
+name: Frontend Continuous Deployment
+
+on:
+  # Runs on merges/pushes to main, only when the frontend application changes.
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/frontend/**'
+      - 'starter/frontend/k8s/**'
+      - '.github/workflows/frontend-cd.yaml'
+      - '.github/actions/frontend-setup/**'
+
+  # Runnable on-demand for verification.
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-cd
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '18.14'
+  WORKING_DIRECTORY: starter/frontend
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: frontend
+  EKS_CLUSTER_NAME: cluster
+  K8S_NAMESPACE: default
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Same lint/test jobs as CI, running in parallel.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS, restore cache and install dependencies
+        uses: ./.github/actions/frontend-setup
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Run lint
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS, restore cache and install dependencies
+        uses: ./.github/actions/frontend-setup
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Run tests
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          CI: true
+        run: npm run test
+
+  # ---------------------------------------------------------------------------
+  # BUILD: gated on lint + test, tags with the git SHA and pushes to ECR.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and push image
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+      api-url: ${{ steps.api.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.25.9'
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      # React inlines REACT_APP_* variables at BUILD time, so the frontend image
+      # has to know the backend URL before it is built. We read the backend
+      # Service's LoadBalancer hostname straight from the cluster so the two
+      # apps stay wired together without anyone hand-editing a URL.
+      # Fallback order: live cluster value -> repo variable -> localhost.
+      - name: Resolve the backend API URL
+        id: api
+        run: |
+          host=$(kubectl get svc backend -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+
+          if [ -n "$host" ]; then
+            url="http://$host"
+            echo "Resolved backend LoadBalancer: $url"
+          elif [ -n "${{ vars.REACT_APP_MOVIE_API_URL }}" ]; then
+            url="${{ vars.REACT_APP_MOVIE_API_URL }}"
+            echo "::warning::No backend LoadBalancer found; using repository variable $url"
+          else
+            url="http://localhost:5000"
+            echo "::warning::No backend LoadBalancer and no REACT_APP_MOVIE_API_URL variable; falling back to $url"
+          fi
+
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Compose image URI
+        id: image
+        run: echo "uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # build-args is what bakes REACT_APP_MOVIE_API_URL into the bundle.
+      # Image is tagged with github.sha so it traces back to this exact commit.
+      - name: Build and push image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKING_DIRECTORY }}
+          push: true
+          build-args: |
+            REACT_APP_MOVIE_API_URL=${{ steps.api.outputs.url }}
+          tags: |
+            ${{ steps.image.outputs.uri }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise build
+        run: |
+          {
+            echo "## Frontend image pushed"
+            echo ""
+            echo "- Image: \`${{ steps.image.outputs.uri }}\`"
+            echo "- Built with REACT_APP_MOVIE_API_URL=\`${{ steps.api.outputs.url }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY: applies the Kubernetes manifests with the new tag.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EKS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.25.9'
+
+      - name: Setup kustomize
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.3.0 /usr/local/bin
+          kustomize version
+
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      # Local-only edit on the runner; never committed back to the repo.
+      - name: Set image tag in the manifests
+        working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
+        run: |
+          kustomize edit set image frontend=${{ needs.build.outputs.image }}
+          echo "--- rendered kustomization.yaml ---"
+          cat kustomization.yaml
+
+      - name: Apply the Kubernetes manifests
+        working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
+        run: kustomize build | kubectl apply -f -
+
+      - name: Verify rollout
+        run: kubectl rollout status deployment/frontend -n "$K8S_NAMESPACE" --timeout=300s
+
+      - name: Report the frontend URL
+        run: |
+          host=""
+          for i in $(seq 1 30); do
+            host=$(kubectl get svc frontend -n "$K8S_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$host" ] && break
+            echo "Waiting for the LoadBalancer to be assigned..."
+            sleep 10
+          done
+
+          {
+            echo "## Frontend deployed"
+            echo ""
+            echo "- Image: \`${{ needs.build.outputs.image }}\`"
+            echo "- Backend API baked in: \`${{ needs.build.outputs.api-url }}\`"
+            if [ -n "$host" ]; then
+              echo "- App: http://$host"
+            else
+              echo "- LoadBalancer hostname not assigned yet."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          kubectl get deployment,svc,pods -n "$K8S_NAMESPACE" -l app=frontend
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "::error::Frontend deployment failed - diagnostics below"
+          kubectl get pods -n "$K8S_NAMESPACE" -l app=frontend -o wide || true
+          kubectl describe deployment/frontend -n "$K8S_NAMESPACE" || true
+          kubectl logs -n "$K8S_NAMESPACE" -l app=frontend --tail=100 --all-containers || true
+          kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp | tail -30 || true

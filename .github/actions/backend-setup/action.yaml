@@ -1,0 +1,44 @@
+name: 'Backend Setup'
+description: 'Sets up Python + pipenv, restores the virtualenv cache and installs backend dependencies.'
+
+inputs:
+  python-version:
+    description: 'Python version to install. Should match the [requires] block in Pipfile'
+    required: false
+    default: '3.10'
+  working-directory:
+    description: 'Directory containing the Pipfile / Pipfile.lock'
+    required: false
+    default: starter/backend
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    # Restore the cache BEFORE installing dependencies. pipenv stores its
+    # virtualenvs under ~/.local/share/virtualenvs, so caching that directory
+    # skips the (slow) dependency resolution + wheel build on every run.
+    # Keyed on Pipfile.lock so any dependency change invalidates the cache.
+    - name: Restore pipenv cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.local/share/virtualenvs
+          ~/.cache/pip
+        key: ${{ runner.os }}-pipenv-${{ hashFiles(format('{0}/Pipfile.lock', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ runner.os }}-pipenv-
+
+    - name: Install pipenv
+      shell: bash
+      run: pip install --upgrade pipenv
+
+    # --dev is required: flake8 (the linter) lives in [dev-packages].
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: pipenv install --dev

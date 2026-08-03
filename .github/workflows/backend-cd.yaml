@@ -1,0 +1,215 @@
+name: Backend Continuous Deployment
+
+on:
+  # Runs on merges/pushes to main, only when the backend application changes.
+  push:
+    branches:
+      - main
+    paths:
+      - 'starter/backend/**'
+      - 'starter/backend/k8s/**'
+      - '.github/workflows/backend-cd.yaml'
+      - '.github/actions/backend-setup/**'
+
+  # Runnable on-demand for verification.
+  workflow_dispatch:
+
+# Never let two deploys race each other onto the same cluster.
+concurrency:
+  group: backend-cd
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.10'
+  WORKING_DIRECTORY: starter/backend
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: backend
+  EKS_CLUSTER_NAME: cluster
+  K8S_NAMESPACE: default
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Same lint/test jobs as CI, running in parallel.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache and install dependencies
+        uses: ./.github/actions/backend-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Run lint
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: pipenv run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python, restore cache and install dependencies
+        uses: ./.github/actions/backend-setup
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          working-directory: ${{ env.WORKING_DIRECTORY }}
+
+      - name: Run tests
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        run: pipenv run test
+
+  # ---------------------------------------------------------------------------
+  # BUILD: gated on lint + test, tags with the git SHA and pushes to ECR.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and push image
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Credentials come from GitHub Secrets only - nothing is ever hardcoded
+      # in the workflow file.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Third-party action that exchanges the AWS credentials above for a short
+      # lived docker login against ECR. Its `registry` output gives us
+      # <account-id>.dkr.ecr.<region>.amazonaws.com, so the account ID never
+      # needs to be written down anywhere.
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compose image URI
+        id: image
+        run: echo "uri=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Tagged with github.sha (the GitHub context) so every image is traceable
+      # back to the exact commit that produced it. `latest` is a convenience
+      # pointer only - the deploy always uses the SHA tag.
+      - name: Build and push image to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.WORKING_DIRECTORY }}
+          push: true
+          tags: |
+            ${{ steps.image.outputs.uri }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summarise build
+        run: |
+          {
+            echo "## Backend image pushed"
+            echo ""
+            echo '`${{ steps.image.outputs.uri }}`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY: applies the Kubernetes manifests with the new tag.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to EKS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.25.9'
+
+      # `kustomize edit` is a CLI subcommand that ships with standalone
+      # kustomize; `kubectl kustomize` cannot do it, so we install the binary.
+      - name: Setup kustomize
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.3.0 /usr/local/bin
+          kustomize version
+
+      # Writes ~/.kube/config for the EKS cluster. The github-action-user IAM
+      # user was mapped into system:masters by setup/init.sh.
+      - name: Update kubeconfig for EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      # Rewrites the `backend` image placeholder in kustomization.yaml to the
+      # SHA-tagged ECR image. This edit lives only on the runner - it is never
+      # committed back to the repo.
+      - name: Set image tag in the manifests
+        working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
+        run: |
+          kustomize edit set image backend=${{ needs.build.outputs.image }}
+          echo "--- rendered kustomization.yaml ---"
+          cat kustomization.yaml
+
+      - name: Apply the Kubernetes manifests
+        working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
+        run: kustomize build | kubectl apply -f -
+
+      # Fail loudly if the new pods never become ready, instead of reporting a
+      # green deploy for an image that crash-loops.
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/backend -n "$K8S_NAMESPACE" --timeout=300s
+
+      - name: Report the backend URL
+        run: |
+          host=""
+          for i in $(seq 1 30); do
+            host=$(kubectl get svc backend -n "$K8S_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$host" ] && break
+            echo "Waiting for the LoadBalancer to be assigned..."
+            sleep 10
+          done
+
+          {
+            echo "## Backend deployed"
+            echo ""
+            echo "- Image: \`${{ needs.build.outputs.image }}\`"
+            if [ -n "$host" ]; then
+              echo "- API: http://$host/movies"
+            else
+              echo "- LoadBalancer hostname not assigned yet."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          kubectl get deployment,svc,pods -n "$K8S_NAMESPACE" -l app=backend
+
+      # Error handling: on any failure, dump enough cluster state to debug from
+      # the run log alone.
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "::error::Backend deployment failed - diagnostics below"
+          kubectl get pods -n "$K8S_NAMESPACE" -l app=backend -o wide || true
+          kubectl describe deployment/backend -n "$K8S_NAMESPACE" || true
+          kubectl logs -n "$K8S_NAMESPACE" -l app=backend --tail=100 --all-containers || true
+          kubectl get events -n "$K8S_NAMESPACE" --sort-by=.lastTimestamp | tail -30 || true
