@@ -1,7 +1,6 @@
 name: Backend Continuous Integration
 
 on:
-  # Run on PRs against main, only when the backend application changes.
   pull_request:
     branches:
       - main
@@ -10,7 +9,6 @@ on:
       - '.github/workflows/backend-ci.yaml'
       - '.github/actions/backend-setup/**'
 
-  # Runnable on-demand.
   workflow_dispatch:
 
 concurrency:
@@ -22,9 +20,7 @@ env:
   WORKING_DIRECTORY: starter/backend
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # LINT and TEST run in PARALLEL (neither declares `needs:`).
-  # ---------------------------------------------------------------------------
+  # lint and test declare no `needs:`, so they run in parallel.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -38,8 +34,6 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
-      # `pipenv run lint` maps to `flake8`, configured by starter/backend/.flake8
-      # (max-line-length=120). flake8 exits non-zero on any finding.
       - name: Run lint
         working-directory: ${{ env.WORKING_DIRECTORY }}
         run: pipenv run lint
@@ -57,14 +51,10 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
-      # `pipenv run test` maps to `pytest -v`.
       - name: Run tests
         working-directory: ${{ env.WORKING_DIRECTORY }}
         run: pipenv run test
 
-  # ---------------------------------------------------------------------------
-  # BUILD gated on lint + test via `needs:`.
-  # ---------------------------------------------------------------------------
   build:
     name: Build
     needs: [lint, test]
@@ -86,8 +76,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # The backend image compiles uwsgi from source, so the layer cache saves
-      # several minutes per run.
+      # Layer cache matters here - the image compiles uwsgi from C source.
       - name: Build docker image
         uses: docker/build-push-action@v6
         with:
@@ -98,7 +87,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Boot the image and hit /movies, exactly like the dev notes describe.
+      # Prove the image boots and serves, not just that `docker build` exited 0.
       - name: Smoke test the image
         run: |
           docker run --name mp-backend -d -p 5000:5000 mp-backend:latest
@@ -116,12 +105,10 @@ jobs:
           docker rm -f mp-backend
           exit 1
 
-  # ---------------------------------------------------------------------------
-  # Error handling / notification.
-  # ---------------------------------------------------------------------------
   report:
     name: Report status
     needs: [lint, test, build]
+    # Without always(), a failed dependency would skip this job too.
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -173,6 +160,8 @@ jobs:
               body,
             });
 
+      # Required: always() above would otherwise let this job go green and mask
+      # an upstream failure.
       - name: Fail the workflow if any job failed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: |

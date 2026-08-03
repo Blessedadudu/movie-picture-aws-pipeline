@@ -19,10 +19,8 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
 
-    # Restore the cache BEFORE installing dependencies. pipenv stores its
-    # virtualenvs under ~/.local/share/virtualenvs, so caching that directory
-    # skips the (slow) dependency resolution + wheel build on every run.
-    # Keyed on Pipfile.lock so any dependency change invalidates the cache.
+    # Keyed on Pipfile.lock so a dependency change busts the cache automatically.
+    # Must restore before installing.
     - name: Restore pipenv cache
       uses: actions/cache@v4
       with:

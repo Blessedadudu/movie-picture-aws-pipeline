@@ -1,9 +1,6 @@
 name: Frontend Continuous Integration
 
 on:
-  # Requirement: run on pull requests targeting main, but ONLY when the frontend
-  # app changes. The `paths` filter is what keeps backend-only PRs from burning
-  # runner minutes here.
   pull_request:
     branches:
       - main
@@ -12,10 +9,8 @@ on:
       - '.github/workflows/frontend-ci.yaml'
       - '.github/actions/frontend-setup/**'
 
-  # Requirement: must be runnable on-demand, without pushing code.
   workflow_dispatch:
 
-# If a PR gets a second push while CI is still running, cancel the older run.
 concurrency:
   group: frontend-ci-${{ github.ref }}
   cancel-in-progress: true
@@ -23,14 +18,12 @@ concurrency:
 env:
   NODE_VERSION: '18.14'
   WORKING_DIRECTORY: starter/frontend
-  # In CI there is no cluster, so the API URL is just the local default.
-  # The CD workflow overrides this with the real backend LoadBalancer URL.
+  # No cluster in CI, so use the local default. The CD workflow overrides this
+  # with the real backend LoadBalancer URL.
   REACT_APP_MOVIE_API_URL: http://localhost:5000
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # LINT and TEST have no `needs:`, so GitHub schedules them in PARALLEL.
-  # ---------------------------------------------------------------------------
+  # lint and test declare no `needs:`, so they run in parallel.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -38,14 +31,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Composite action = setup-node + cache restore + npm ci.
       - name: Setup NodeJS, restore cache and install dependencies
         uses: ./.github/actions/frontend-setup
         with:
           node-version: ${{ env.NODE_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
-      # eslint exits non-zero on any error, which fails the step and the job.
       - name: Run lint
         working-directory: ${{ env.WORKING_DIRECTORY }}
         run: npm run lint
@@ -63,17 +54,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
-      # CI=true makes react-scripts run the suite once and exit with a status
-      # code, instead of dropping into interactive watch mode and hanging.
+      # CI=true stops react-scripts dropping into interactive watch mode, which
+      # would hang the job until the 6-hour timeout.
       - name: Run tests
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           CI: true
         run: npm run test
 
-  # ---------------------------------------------------------------------------
-  # BUILD only runs if BOTH lint and test succeed (the `needs:` directive).
-  # ---------------------------------------------------------------------------
   build:
     name: Build
     needs: [lint, test]
@@ -88,21 +76,16 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
-      # Re-run the suite here so the artifact we build is provably built from
-      # green code, even if this job is re-run on its own later.
       - name: Run tests
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           CI: true
         run: npm run test
 
-      # Buildx gives us a real layer cache between runs (GitHub Actions cache
-      # backend), which is the main lever on frontend build time.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # build-args passes REACT_APP_MOVIE_API_URL into the image at build time.
-      # React inlines env vars at build time, so this cannot be set at runtime.
+      # React inlines REACT_APP_* at build time, so this cannot be set at runtime.
       - name: Build docker image
         uses: docker/build-push-action@v6
         with:
@@ -115,7 +98,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Prove the image actually boots and serves before we call the build good.
+      # Prove the image boots and serves, not just that `docker build` exited 0.
       - name: Smoke test the image
         run: |
           docker run --name mp-frontend -d -p 3000:3000 mp-frontend:latest
@@ -132,13 +115,10 @@ jobs:
           docker rm -f mp-frontend
           exit 1
 
-  # ---------------------------------------------------------------------------
-  # Error handling / notification. `if: always()` makes this run even when an
-  # upstream job failed - otherwise a failed dependency would skip it too.
-  # ---------------------------------------------------------------------------
   report:
     name: Report status
     needs: [lint, test, build]
+    # Without always(), a failed dependency would skip this job too.
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -190,8 +170,8 @@ jobs:
               body,
             });
 
-      # Make the overall workflow red if anything upstream failed. Without this,
-      # `if: always()` would let the report job go green and mask the failure.
+      # Required: always() above would otherwise let this job go green and mask
+      # an upstream failure.
       - name: Fail the workflow if any job failed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: |
