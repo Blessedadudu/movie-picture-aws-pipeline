@@ -1,5 +1,5 @@
 name: 'Frontend Setup'
-description: 'Checks out nothing; sets up NodeJS, restores the npm cache and installs frontend dependencies.'
+description: 'Sets up NodeJS, restores the npm cache and installs frontend dependencies.'
 
 inputs:
   node-version:
@@ -14,17 +14,15 @@ inputs:
 runs:
   using: composite
   steps:
-    # Setup NodeJS. We pin the version so CI matches what the developers use
-    # locally via `nvm use` (.nvmrc contains 18.14).
     - name: Setup NodeJS
       uses: actions/setup-node@v4
       with:
         node-version: ${{ inputs.node-version }}
 
-    # Restore the cache BEFORE installing dependencies. We cache npm's download
-    # cache (~/.npm) rather than node_modules: it is smaller, and `npm ci` will
-    # still validate the tree against package-lock.json. The key is derived from
-    # the lockfile hash, so a dependency change automatically busts the cache.
+    # Cache ~/.npm (npm's tarball cache) rather than node_modules: smaller, and
+    # `npm ci` still validates the tree against the lockfile. Keyed on the
+    # lockfile hash so a dependency change busts the cache automatically.
+    # Must restore before installing.
     - name: Restore npm cache
       uses: actions/cache@v4
       with:
@@ -33,8 +31,7 @@ runs:
         restore-keys: |
           ${{ runner.os }}-npm-
 
-    # `npm ci` (not `npm install`) - it installs exactly what package-lock.json
-    # pins, which is what makes CI runs reproducible.
+    # `npm ci`, not `npm install` - installs exactly what the lockfile pins.
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.working-directory }}

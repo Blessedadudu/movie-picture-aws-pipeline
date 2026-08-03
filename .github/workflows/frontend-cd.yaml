@@ -1,19 +1,17 @@
 name: Frontend Continuous Deployment
 
 on:
-  # Runs on merges/pushes to main, only when the frontend application changes.
   push:
     branches:
       - main
     paths:
       - 'starter/frontend/**'
-      - 'starter/frontend/k8s/**'
       - '.github/workflows/frontend-cd.yaml'
       - '.github/actions/frontend-setup/**'
 
-  # Runnable on-demand for verification.
   workflow_dispatch:
 
+# Never let two deploys race each other onto the same cluster.
 concurrency:
   group: frontend-cd
   cancel-in-progress: false
@@ -25,11 +23,9 @@ env:
   ECR_REPOSITORY: frontend
   EKS_CLUSTER_NAME: cluster
   K8S_NAMESPACE: default
+  KUBECTL_VERSION: 'v1.33.13'
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Same lint/test jobs as CI, running in parallel.
-  # ---------------------------------------------------------------------------
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -60,15 +56,14 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           working-directory: ${{ env.WORKING_DIRECTORY }}
 
+      # CI=true stops react-scripts dropping into interactive watch mode, which
+      # would hang the job until the 6-hour timeout.
       - name: Run tests
         working-directory: ${{ env.WORKING_DIRECTORY }}
         env:
           CI: true
         run: npm run test
 
-  # ---------------------------------------------------------------------------
-  # BUILD: gated on lint + test, tags with the git SHA and pushes to ECR.
-  # ---------------------------------------------------------------------------
   build:
     name: Build and push image
     needs: [lint, test]
@@ -87,6 +82,8 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The `registry` output is <account-id>.dkr.ecr.<region>.amazonaws.com,
+      # so the AWS account ID never has to be written down in the repo.
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -94,15 +91,14 @@ jobs:
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: 'v1.25.9'
+          version: ${{ env.KUBECTL_VERSION }}
 
       - name: Update kubeconfig for EKS
         run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
-      # React inlines REACT_APP_* variables at BUILD time, so the frontend image
-      # has to know the backend URL before it is built. We read the backend
-      # Service's LoadBalancer hostname straight from the cluster so the two
-      # apps stay wired together without anyone hand-editing a URL.
+      # React inlines REACT_APP_* at BUILD time, so the image has to know the
+      # backend URL before it is built. Read it from the cluster so the two apps
+      # stay wired together without anyone hand-editing a URL.
       # Fallback order: live cluster value -> repo variable -> localhost.
       - name: Resolve the backend API URL
         id: api
@@ -130,8 +126,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # build-args is what bakes REACT_APP_MOVIE_API_URL into the bundle.
-      # Image is tagged with github.sha so it traces back to this exact commit.
+      # `latest` is a convenience pointer only - the deploy always uses the SHA tag.
       - name: Build and push image to ECR
         uses: docker/build-push-action@v6
         with:
@@ -154,9 +149,6 @@ jobs:
             echo "- Built with REACT_APP_MOVIE_API_URL=\`${{ steps.api.outputs.url }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------------
-  # DEPLOY: applies the Kubernetes manifests with the new tag.
-  # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to EKS
     needs: build
@@ -172,20 +164,29 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Keep within one minor version of the cluster's Kubernetes version.
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: 'v1.25.9'
+          version: ${{ env.KUBECTL_VERSION }}
 
+      # Installed into a private dir, not /usr/local/bin: ubuntu-latest already
+      # ships a kustomize there and install_kustomize.sh refuses to overwrite it.
+      # GITHUB_PATH entries are prepended, so this pinned version wins.
       - name: Setup kustomize
         run: |
-          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s 5.3.0 /usr/local/bin
-          kustomize version
+          mkdir -p "$RUNNER_TEMP/kustomize-bin"
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" \
+            | bash -s 5.3.0 "$RUNNER_TEMP/kustomize-bin"
+          echo "$RUNNER_TEMP/kustomize-bin" >> "$GITHUB_PATH"
+
+      - name: Show kustomize version
+        run: kustomize version
 
       - name: Update kubeconfig for EKS
         run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
 
-      # Local-only edit on the runner; never committed back to the repo.
+      # This edit lives only on the runner - never committed back to the repo.
       - name: Set image tag in the manifests
         working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
         run: |
@@ -197,6 +198,8 @@ jobs:
         working-directory: ${{ env.WORKING_DIRECTORY }}/k8s
         run: kustomize build | kubectl apply -f -
 
+      # Without this, `apply` returns instantly and the job goes green even if
+      # every new pod crash-loops.
       - name: Verify rollout
         run: kubectl rollout status deployment/frontend -n "$K8S_NAMESPACE" --timeout=300s
 
