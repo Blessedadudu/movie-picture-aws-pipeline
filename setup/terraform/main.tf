@@ -306,9 +306,22 @@ resource "aws_iam_user" "github_action_user" {
   name = "github-action-user"
 }
 
-resource "aws_iam_user_policy" "github_action_user_permission" {
-  user   = aws_iam_user.github_action_user.name
-  policy = data.aws_iam_policy_document.github_policy.json
+# NOTE: the original template used an *inline* user policy (aws_iam_user_policy,
+# i.e. the iam:PutUserPolicy API). AWS Academy / Udacity "voclabs" federated
+# roles deny iam:PutUserPolicy, so that resource fails with:
+#   AccessDenied: ... not authorized to perform: iam:PutUserPolicy
+# The same role IS allowed iam:CreatePolicy and iam:AttachUserPolicy, so this
+# grants the identical permissions as a customer-managed policy attachment
+# instead. Functionally equivalent, and it applies cleanly as the lab user.
+resource "aws_iam_policy" "github_action_user_permission" {
+  name        = "github-action-user-policy"
+  description = "Permissions for the GitHub Actions CI/CD user (ECR push, EKS describe)"
+  policy      = data.aws_iam_policy_document.github_policy.json
+}
+
+resource "aws_iam_user_policy_attachment" "github_action_user_permission" {
+  user       = aws_iam_user.github_action_user.name
+  policy_arn = aws_iam_policy.github_action_user_permission.arn
 }
 
 data "aws_iam_policy_document" "github_policy" {
